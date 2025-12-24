@@ -36,6 +36,7 @@ end
 
 -- Export functions for programmatic use
 M.filter_log = FilterLog
+M.filter_log_negated = FilterLogNegated
 M.show_matching_lines = ShowMatchingLines
 M.save_filtered = SaveFiltered
 M.undo_filter = UndoFilter

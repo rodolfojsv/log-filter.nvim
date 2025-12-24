@@ -268,7 +268,35 @@ function FilterLog()
     -- Save pattern to history
     add_to_history(pattern)
     
-    -- Get all lines
+    -- Parse existing headers BEFORE reload to preserve accumulated patterns
+    local existing_filter_patterns = {}
+    local existing_exclude_patterns = {}
+    
+    if vim.bo.buftype == 'acwrite' then
+      local current_lines = vim.api.nvim_buf_get_lines(0, 0, 100, false)
+      for _, line in ipairs(current_lines) do
+        if line:match('^Filter:%s*(.+)') then
+          local filter_pattern = line:match('^Filter:%s*(.+)')
+          table.insert(existing_filter_patterns, filter_pattern)
+        elseif line:match('^Exclude:%s*(.+)') then
+          local exclude_pattern = line:match('^Exclude:%s*(.+)')
+          table.insert(existing_exclude_patterns, exclude_pattern)
+        elseif line:match('^%-+$') then
+          break  -- End of headers
+        end
+      end
+    end
+    
+    -- If we have an original file stored and this is a filtered buffer, reload it first
+    local was_filtered = vim.bo.buftype == 'acwrite'
+    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 then
+      -- Reload original file
+      vim.cmd('edit! ' .. vim.fn.fnameescape(original_file))
+      -- Restore original file tracking
+      vim.b.log_filter_original_file = original_file
+    end
+    
+    -- Get all lines (now from reloaded base content)
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     
     -- Find where headers end (scan for header patterns)
@@ -282,13 +310,13 @@ function FilterLog()
       if line:match('^Original files:') then
         in_file_list = true
         header_end = i
-      elseif in_file_list and (line:match('^From:') or line:match('^Filter:') or line:match('^%-+$')) then
+      elseif in_file_list and (line:match('^From:') or line:match('^Filter:') or line:match('^Exclude:') or line:match('^Combined Regex:') or line:match('^%-+$')) then
         -- Exiting file list section
         in_file_list = false
         header_end = i
       elseif in_file_list or line:match('^Original file:') or line:match('^From:') or 
-             line:match('^To:') or line:match('^Filter:') or 
-             line == '' or line:match('^%-+$') then
+             line:match('^To:') or line:match('^Filter:') or line:match('^Exclude:') or
+             line:match('^Combined Regex:') or line == '' or line:match('^%-+$') then
         header_end = i
       else
         -- Hit actual content
@@ -298,16 +326,50 @@ function FilterLog()
     
     local matching_lines
     
+    -- Extract existing headers to get patterns
+    local header_lines = {}
+    for i = 1, header_end do
+      table.insert(header_lines, lines[i])
+    end
+    
+    -- Parse existing headers into sections (use pre-reload patterns if available)
+    local original_files_section = {}
+    local time_section = {}
+    local filter_patterns = existing_filter_patterns  -- Use preserved patterns
+    local exclude_patterns = existing_exclude_patterns  -- Use preserved patterns
+    
+    local in_files_list = false
+    for _, line in ipairs(header_lines) do
+      if line:match('^Original file:') or line:match('^Original files:') then
+        table.insert(original_files_section, line)
+        in_files_list = line:match('^Original files:') ~= nil
+      elseif in_files_list and not line:match('^From:') and not line:match('^To:') and not line:match('^Filter:') and not line:match('^Exclude:') and line ~= '' and not line:match('^%-+$') then
+        -- This is part of the file list
+        table.insert(original_files_section, line)
+      elseif line:match('^From:') or line:match('^To:') then
+        in_files_list = false
+        table.insert(time_section, line)
+      end
+      -- Note: Filter/Exclude patterns already extracted before reload
+    end
+    
+    -- Add new pattern to the filter list
+    table.insert(filter_patterns, pattern)
+    
+    -- Build filter pattern (just positive filters)
+    local combined_filter = table.concat(filter_patterns, '|')
+    
     -- Try ripgrep first for speed (if file is saved)
+    local matching_lines
     if has_ripgrep() then
-      matching_lines = filter_with_ripgrep(pattern, lines, current_line_num)
+      matching_lines = filter_with_ripgrep(combined_filter, lines, current_line_num)
     end
     
     -- Fallback to Vim regex if ripgrep failed or not available
     if not matching_lines then
       matching_lines = {}
-      local clean_pattern = pattern:gsub('^%((.*)%)$', '%1')
-      local vim_pattern = '\\v' .. clean_pattern
+      local clean_pattern = combined_filter:gsub('^%((.*)%)$', '%1')
+      local vim_pattern = '\v' .. clean_pattern
       
       for i, line in ipairs(lines) do
         if vim.fn.match(line, vim_pattern) ~= -1 then
@@ -343,47 +405,112 @@ function FilterLog()
     -- Build context blocks from content
     local result_lines, line_mapping, match_count = build_context_blocks(content_lines, content_matching, current_line_num)
     
-    -- Extract headers for preservation
-    local header_lines = {}
-    for i = 1, header_end do
-      table.insert(header_lines, lines[i])
+    -- If we have exclude patterns, filter out entire blocks that contain excluded text
+    if #exclude_patterns > 0 then
+      local combined_exclude = table.concat(exclude_patterns, '|')
+      local clean_exclude = combined_exclude:gsub('^%((.*)%)$', '%1')
+      local vim_exclude_pattern = '\v' .. clean_exclude
+      
+      -- Find blocks to exclude by scanning for empty line separators
+      local filtered_result = {}
+      local current_block = {}
+      local block_has_exclude = false
+      
+      for _, line in ipairs(result_lines) do
+        if line == '' then
+          -- End of block - add it if not excluded
+          if #current_block > 0 and not block_has_exclude then
+            for _, block_line in ipairs(current_block) do
+              table.insert(filtered_result, block_line)
+            end
+            table.insert(filtered_result, '')  -- Add separator
+          end
+          current_block = {}
+          block_has_exclude = false
+        else
+          table.insert(current_block, line)
+          -- Check if this line matches exclude pattern
+          if vim.fn.match(line, vim_exclude_pattern) ~= -1 then
+            block_has_exclude = true
+          end
+        end
+      end
+      
+      -- Don't forget last block
+      if #current_block > 0 and not block_has_exclude then
+        for _, block_line in ipairs(current_block) do
+          table.insert(filtered_result, block_line)
+        end
+      end
+      
+      result_lines = filtered_result
+      
+      -- Recalculate match count
+      local block_count = 0
+      for _, line in ipairs(result_lines) do
+        if line == '' then
+          block_count = block_count + 1
+        end
+      end
+      match_count = block_count
+      
+      -- Check if we excluded everything
+      if #result_lines == 0 then
+        vim.notify('All matching entries were excluded!', vim.log.levels.WARN)
+        return
+      end
     end
     
-    -- Preserve existing headers and add/update filter info
+    -- Build final pattern for display
+    local final_pattern
+    if #exclude_patterns > 0 then
+      local exclude_part = table.concat(exclude_patterns, '|')
+      final_pattern = '^(?!.*(' .. exclude_part .. ')).*(' .. combined_filter .. ')'
+    else
+      final_pattern = combined_filter
+    end
+    
+    -- Build final header in correct order
     local final_header_lines = {}
     
-    -- Remove old Filter lines from preserved headers
-    for _, line in ipairs(header_lines) do
-      if not line:match('^Filter:') then
+    -- 1. Original files section (always first)
+    if #original_files_section > 0 then
+      for _, line in ipairs(original_files_section) do
+        table.insert(final_header_lines, line)
+      end
+    else
+      table.insert(final_header_lines, 'Original file: ' .. original_name)
+    end
+    
+    -- 2. Time section (if any)
+    if #time_section > 0 then
+      table.insert(final_header_lines, '')
+      for _, line in ipairs(time_section) do
         table.insert(final_header_lines, line)
       end
     end
     
-    -- Remove trailing empty lines and dashes
-    while #final_header_lines > 0 do
-      local last_line = final_header_lines[#final_header_lines]
-      if last_line == '' or last_line:match('^%-+$') then
-        table.remove(final_header_lines)
-      else
-        break
+    -- 3. Filter section (each pattern on its own line)
+    if #filter_patterns > 0 then
+      table.insert(final_header_lines, '')
+      for _, filter_pattern in ipairs(filter_patterns) do
+        table.insert(final_header_lines, 'Filter: ' .. filter_pattern)
       end
     end
     
-    -- If we have preserved headers, add separator
-    if #final_header_lines > 0 then
+    -- 4. Exclude section (each pattern on its own line)
+    if #exclude_patterns > 0 then
       table.insert(final_header_lines, '')
-      table.insert(final_header_lines, string.rep('-', 80))
-      table.insert(final_header_lines, '')
-    else
-      -- No existing headers, add original file header
-      table.insert(final_header_lines, 'Original file: ' .. original_name)
-      table.insert(final_header_lines, '')
-      table.insert(final_header_lines, string.rep('-', 80))
-      table.insert(final_header_lines, '')
+      for _, exclude_pattern in ipairs(exclude_patterns) do
+        table.insert(final_header_lines, 'Exclude: ' .. exclude_pattern)
+      end
     end
     
-    -- Add filter line
-    table.insert(final_header_lines, 'Filter: ' .. pattern)
+    -- 5. Combined regex for debugging
+    table.insert(final_header_lines, '')
+    table.insert(final_header_lines, 'Combined Regex: ' .. final_pattern)
+    
+    -- 6. One separator at the end
     table.insert(final_header_lines, '')
     table.insert(final_header_lines, string.rep('-', 80))
     table.insert(final_header_lines, '')
@@ -398,7 +525,7 @@ function FilterLog()
     end
     
     -- Set winbar to show filter at top of window (stays fixed while scrolling)
-    vim.wo.winbar = '%#Comment#Filter: ' .. pattern .. ' %#Normal#' .. string.rep('─', 60)
+    vim.wo.winbar = '%#Comment#' .. final_pattern .. ' %#Normal#' .. string.rep('─', 40)
     
     -- Replace buffer contents with matching lines
     vim.api.nvim_buf_set_lines(0, 0, -1, false, final_lines)
@@ -448,6 +575,317 @@ function FilterLog()
     
     -- Filter immediately with the pattern
     do_filter(pattern)
+  end)
+end
+
+function FilterLogNegated()
+  -- Store original filename for reference
+  local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
+  local original_name = vim.fn.fnamemodify(original_file, ':t')
+  
+  -- Save current line and position to restore after filtering
+  local current_line = vim.api.nvim_get_current_line()
+  local current_line_num = vim.api.nvim_win_get_cursor(0)[1]
+  
+  local function do_exclude(pattern)
+    if not pattern or pattern == '' then
+      return
+    end
+
+    -- Save pattern to history
+    add_to_history(pattern)
+    
+    -- Parse existing headers BEFORE reload to preserve accumulated patterns
+    local existing_filter_patterns = {}
+    local existing_exclude_patterns = {}
+    
+    if vim.bo.buftype == 'acwrite' then
+      local current_lines = vim.api.nvim_buf_get_lines(0, 0, 100, false)
+      for _, line in ipairs(current_lines) do
+        if line:match('^Filter:%s*(.+)') then
+          local filter_pattern = line:match('^Filter:%s*(.+)')
+          table.insert(existing_filter_patterns, filter_pattern)
+        elseif line:match('^Exclude:%s*(.+)') then
+          local exclude_pattern = line:match('^Exclude:%s*(.+)')
+          table.insert(existing_exclude_patterns, exclude_pattern)
+        elseif line:match('^%-+$') then
+          break  -- End of headers
+        end
+      end
+    end
+    
+    -- If we have an original file stored and this is a filtered buffer, reload it first
+    local was_filtered = vim.bo.buftype == 'acwrite'
+    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 then
+      -- Reload original file
+      vim.cmd('edit! ' .. vim.fn.fnameescape(original_file))
+      -- Restore original file tracking
+      vim.b.log_filter_original_file = original_file
+    end
+    
+    -- Get all lines (now from reloaded base content)
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    
+    -- Find where headers end
+    local header_end = 0
+    local in_file_list = false
+    
+    for i = 1, math.min(100, #lines) do
+      local line = lines[i]
+      
+      if line:match('^Original files:') then
+        in_file_list = true
+        header_end = i
+      elseif in_file_list and (line:match('^From:') or line:match('^Filter:') or line:match('^Exclude:') or line:match('^Combined Regex:') or line:match('^%-+$')) then
+        in_file_list = false
+        header_end = i
+      elseif in_file_list or line:match('^Original file:') or line:match('^From:') or 
+             line:match('^To:') or line:match('^Filter:') or line:match('^Exclude:') or
+             line:match('^Combined Regex:') or line == '' or line:match('^%-+$') then
+        header_end = i
+      else
+        break
+      end
+    end
+    
+    -- Extract existing headers
+    local header_lines = {}
+    for i = 1, header_end do
+      table.insert(header_lines, lines[i])
+    end
+    
+    -- Parse existing headers (use pre-reload patterns if available)
+    local original_files_section = {}
+    local time_section = {}
+    local filter_patterns = existing_filter_patterns  -- Use preserved patterns
+    local exclude_patterns = existing_exclude_patterns  -- Use preserved patterns
+    
+    local in_files_list = false
+    for _, line in ipairs(header_lines) do
+      if line:match('^Original file:') or line:match('^Original files:') then
+        table.insert(original_files_section, line)
+        in_files_list = line:match('^Original files:') ~= nil
+      elseif in_files_list and not line:match('^From:') and not line:match('^To:') and not line:match('^Filter:') and not line:match('^Exclude:') and line ~= '' and not line:match('^%-+$') then
+        table.insert(original_files_section, line)
+      elseif line:match('^From:') or line:match('^To:') then
+        in_files_list = false
+        table.insert(time_section, line)
+      end
+      -- Note: Filter/Exclude patterns already extracted before reload
+    end
+    
+    -- Add new pattern to exclude list
+    table.insert(exclude_patterns, pattern)
+    
+    -- Start with all content or filtered content
+    local matching_lines = {}
+    
+    if #filter_patterns > 0 then
+      -- Apply positive filters
+      local combined_filter = table.concat(filter_patterns, '|')
+      
+      if has_ripgrep() then
+        matching_lines = filter_with_ripgrep(combined_filter, lines, current_line_num)
+      end
+      
+      if not matching_lines then
+        matching_lines = {}
+        local clean_pattern = combined_filter:gsub('^%((.*)%)$', '%1')
+        local vim_pattern = '\v' .. clean_pattern
+        
+        for i, line in ipairs(lines) do
+          if vim.fn.match(line, vim_pattern) ~= -1 then
+            matching_lines[i] = true
+          end
+        end
+      end
+    else
+      -- No positive filters, start with all content lines
+      for i = header_end + 1, #lines do
+        matching_lines[i] = true
+      end
+    end
+    
+    -- Check if we have any results
+    if vim.tbl_count(matching_lines) == 0 then
+      vim.notify('All lines were excluded!', vim.log.levels.WARN)
+      return
+    end
+    
+    -- Build context blocks
+    local content_lines = {}
+    local content_matching = {}
+    
+    for i = header_end + 1, #lines do
+      table.insert(content_lines, lines[i])
+      if matching_lines[i] then
+        content_matching[i - header_end] = true
+      end
+    end
+    
+    local result_lines, line_mapping, match_count = build_context_blocks(content_lines, content_matching, current_line_num)
+    
+    -- Filter out entire blocks that contain excluded text
+    local combined_exclude = table.concat(exclude_patterns, '|')
+    local clean_exclude = combined_exclude:gsub('^%((.*)%)$', '%1')
+    local vim_exclude_pattern = '\\v' .. clean_exclude
+    
+    -- Find blocks to exclude by scanning for empty line separators
+    local filtered_result = {}
+    local current_block = {}
+    local block_has_exclude = false
+    
+    for _, line in ipairs(result_lines) do
+      if line == '' then
+        -- End of block - add it if not excluded
+        if #current_block > 0 and not block_has_exclude then
+          for _, block_line in ipairs(current_block) do
+            table.insert(filtered_result, block_line)
+          end
+          table.insert(filtered_result, '')  -- Add separator
+        end
+        current_block = {}
+        block_has_exclude = false
+      else
+        table.insert(current_block, line)
+        -- Check if this line matches exclude pattern
+        if vim.fn.match(line, vim_exclude_pattern) ~= -1 then
+          block_has_exclude = true
+        end
+      end
+    end
+    
+    -- Don't forget last block
+    if #current_block > 0 and not block_has_exclude then
+      for _, block_line in ipairs(current_block) do
+        table.insert(filtered_result, block_line)
+      end
+    end
+    
+    result_lines = filtered_result
+    
+    -- Recalculate match count
+    local block_count = 0
+    for _, line in ipairs(result_lines) do
+      if line == '' then
+        block_count = block_count + 1
+      end
+    end
+    match_count = block_count
+    
+    -- Check if all entries were excluded
+    if #result_lines == 0 then
+      vim.notify('All entries were excluded!', vim.log.levels.WARN)
+      return
+    end
+    
+    -- Build final pattern for display
+    local final_pattern
+    if #filter_patterns > 0 then
+      local filter_part = table.concat(filter_patterns, '|')
+      local exclude_part = table.concat(exclude_patterns, '|')
+      final_pattern = '^(?!.*(' .. exclude_part .. ')).*(' .. filter_part .. ')'
+    else
+      local exclude_part = table.concat(exclude_patterns, '|')
+      final_pattern = '^(?!.*(' .. exclude_part .. ')).*'
+    end
+    
+    -- Build final header
+    local final_header_lines = {}
+    
+    -- 1. Original files section
+    if #original_files_section > 0 then
+      for _, line in ipairs(original_files_section) do
+        table.insert(final_header_lines, line)
+      end
+    else
+      table.insert(final_header_lines, 'Original file: ' .. original_name)
+    end
+    
+    -- 2. Time section
+    if #time_section > 0 then
+      table.insert(final_header_lines, '')
+      for _, line in ipairs(time_section) do
+        table.insert(final_header_lines, line)
+      end
+    end
+    
+    -- 3. Filter section
+    if #filter_patterns > 0 then
+      table.insert(final_header_lines, '')
+      for _, filter_pattern in ipairs(filter_patterns) do
+        table.insert(final_header_lines, 'Filter: ' .. filter_pattern)
+      end
+    end
+    
+    -- 4. Exclude section
+    table.insert(final_header_lines, '')
+    for _, exclude_pattern in ipairs(exclude_patterns) do
+      table.insert(final_header_lines, 'Exclude: ' .. exclude_pattern)
+    end
+    
+    -- 5. Combined regex for debugging
+    table.insert(final_header_lines, '')
+    table.insert(final_header_lines, 'Combined Regex: ' .. final_pattern)
+    
+    -- 6. Separator
+    table.insert(final_header_lines, '')
+    table.insert(final_header_lines, string.rep('-', 80))
+    table.insert(final_header_lines, '')
+    
+    -- Combine
+    local final_lines = {}
+    for _, line in ipairs(final_header_lines) do
+      table.insert(final_lines, line)
+    end
+    for _, line in ipairs(result_lines) do
+      table.insert(final_lines, line)
+    end
+    
+    -- Set winbar
+    vim.wo.winbar = '%#Comment#' .. final_pattern .. ' %#Normal#' .. string.rep('─', 40)
+    
+    -- Update buffer
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, final_lines)
+    vim.bo.buftype = 'acwrite'
+    vim.bo.modified = false
+    vim.b.log_filter_original_file = original_file
+    
+    -- Position cursor
+    local found_exact = false
+    for i, line in ipairs(result_lines) do
+      if line == current_line then
+        vim.api.nvim_win_set_cursor(0, {i, 0})
+        found_exact = true
+        break
+      end
+    end
+    
+    if not found_exact then
+      local closest_line = nil
+      local min_distance = math.huge
+      
+      for orig_line_num, filt_line_num in pairs(line_mapping) do
+        local distance = math.abs(orig_line_num - current_line_num)
+        if distance < min_distance then
+          min_distance = distance
+          closest_line = filt_line_num
+        end
+      end
+      
+      if closest_line then
+        vim.api.nvim_win_set_cursor(0, {closest_line, 0})
+      end
+    end
+  end
+  
+  -- Call history selector
+  show_history_selector(function(pattern)
+    if not pattern or pattern == '' then
+      return
+    end
+    
+    do_exclude(pattern)
   end)
 end
 
@@ -530,9 +968,6 @@ function SaveFiltered()
     
     -- Rename existing .filtered to .old_N
     local success = vim.fn.rename(filtered_file, old_file)
-    if success == 0 then
-      vim.notify('Backed up previous filter to: ' .. vim.fn.fnamemodify(old_file, ':t'), vim.log.levels.INFO)
-    end
   end
   
   -- Save current buffer to .filtered
@@ -552,6 +987,9 @@ function UndoFilter()
   
   -- Clear the winbar filter display
   vim.wo.winbar = ''
+  
+  -- Clear any stored filter patterns
+  vim.b.log_filter_patterns = nil
   
   -- Reload the buffer
   vim.cmd('edit!')
@@ -1018,8 +1456,8 @@ function FilterByTime()
         end
       end
       
-      -- Preserve existing headers (Original files list) and add time filter info
-      local header_lines = {}
+      -- Preserve existing headers and add time filter info
+      local existing_headers = {}
       local existing_header_end = 0
       
       -- Check if buffer has existing headers to preserve
@@ -1046,43 +1484,113 @@ function FilterByTime()
         end
       end
       
-      -- Keep existing headers if found (excluding old From/To lines)
+      -- Extract existing headers (excluding old From/To lines and separators)
       if existing_header_end > 0 then
         for i = 1, existing_header_end do
           local line = lines[i]
-          -- Skip old From/To lines if they exist
-          if not line:match('^From:') and not line:match('^To:') then
-            table.insert(header_lines, line)
+          if not line:match('^From:') and not line:match('^To:') and not line:match('^Combined Regex:') and line ~= '' and not line:match('^%-+$') then
+            table.insert(existing_headers, line)
           end
-        end
-        
-        -- Remove trailing empty lines and dashes from preserved headers
-        while #header_lines > 0 do
-          local last_line = header_lines[#header_lines]
-          if last_line == '' or last_line:match('^%-+$') then
-            table.remove(header_lines)
-          else
-            break
-          end
-        end
-        
-        -- Add back separator
-        table.insert(header_lines, '')
-        table.insert(header_lines, string.rep('-', 80))
-        table.insert(header_lines, '')
-      else
-        -- Add original file header if no existing headers
-        if original_name and original_name ~= '' then
-          table.insert(header_lines, 'Original file: ' .. original_name)
-          table.insert(header_lines, '')
-          table.insert(header_lines, string.rep('-', 80))
-          table.insert(header_lines, '')
         end
       end
       
-      -- Add time filter info at the end of headers
+      -- Parse existing headers into sections
+      local original_files_section = {}
+      local filter_section = {}
+      local exclude_section = {}
+      
+      local in_files_list = false
+      for _, line in ipairs(existing_headers) do
+        if line:match('^Original file:') or line:match('^Original files:') then
+          table.insert(original_files_section, line)
+          in_files_list = line:match('^Original files:') ~= nil
+        elseif in_files_list and not line:match('^Filter:') and not line:match('^Exclude:') then
+          -- This is part of the file list
+          table.insert(original_files_section, line)
+        elseif line:match('^Filter:') then
+          in_files_list = false
+          table.insert(filter_section, line)
+        elseif line:match('^Exclude:') then
+          in_files_list = false
+          table.insert(exclude_section, line)
+        end
+      end
+      
+      -- Build final header in correct order
+      local header_lines = {}
+      
+      -- 1. Original files section (always first)
+      if #original_files_section > 0 then
+        for _, line in ipairs(original_files_section) do
+          table.insert(header_lines, line)
+        end
+      else
+        if original_name and original_name ~= '' then
+          table.insert(header_lines, 'Original file: ' .. original_name)
+        end
+      end
+      
+      -- 2. Time section
+      table.insert(header_lines, '')
       table.insert(header_lines, 'From: ' .. start_time)
       table.insert(header_lines, 'To: ' .. end_time)
+      
+      -- 3. Filter section (if any)
+      if #filter_section > 0 then
+        table.insert(header_lines, '')
+        for _, line in ipairs(filter_section) do
+          table.insert(header_lines, line)
+        end
+      end
+      
+      -- 4. Exclude section (if any)
+      if #exclude_section > 0 then
+        table.insert(header_lines, '')
+        for _, line in ipairs(exclude_section) do
+          table.insert(header_lines, line)
+        end
+      end
+      
+      -- 5. Combined regex (if we have filters or excludes)
+      if #filter_section > 0 or #exclude_section > 0 then
+        table.insert(header_lines, '')
+        
+        -- Extract patterns from sections to rebuild combined regex
+        local filter_patterns = {}
+        for _, line in ipairs(filter_section) do
+          local pattern = line:match('^Filter:%s*(.+)')
+          if pattern then
+            table.insert(filter_patterns, pattern)
+          end
+        end
+        
+        local exclude_patterns = {}
+        for _, line in ipairs(exclude_section) do
+          local pattern = line:match('^Exclude:%s*(.+)')
+          if pattern then
+            table.insert(exclude_patterns, pattern)
+          end
+        end
+        
+        -- Build combined regex
+        local combined_regex
+        if #filter_patterns > 0 and #exclude_patterns > 0 then
+          local filter_part = table.concat(filter_patterns, '|')
+          local exclude_part = table.concat(exclude_patterns, '|')
+          combined_regex = '^(?!.*(' .. exclude_part .. ')).*(' .. filter_part .. ')'
+        elseif #filter_patterns > 0 then
+          combined_regex = table.concat(filter_patterns, '|')
+        elseif #exclude_patterns > 0 then
+          local exclude_part = table.concat(exclude_patterns, '|')
+          combined_regex = '^(?!.*(' .. exclude_part .. ')).*'
+        end
+        
+        if combined_regex then
+          table.insert(header_lines, 'Combined Regex: ' .. combined_regex)
+        end
+      end
+      
+      -- 6. One separator at the end
       table.insert(header_lines, '')
       table.insert(header_lines, string.rep('-', 80))
       table.insert(header_lines, '')
