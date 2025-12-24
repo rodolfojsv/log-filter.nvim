@@ -67,6 +67,9 @@ end
 local function show_history_selector(callback)
   local history = load_history()
   
+  -- Sort history in descending order
+  table.sort(history, function(a, b) return a > b end)
+  
   -- Check if telescope is available
   local has_telescope, pickers = pcall(require, 'telescope.pickers')
   local has_finders, finders = pcall(require, 'telescope.finders')
@@ -177,7 +180,7 @@ local function build_context_blocks(lines, matching_lines, current_line_num)
   local block_starts = {}
   local match_count = 0
   
-  -- For each matching line, include context (lines above until empty line)
+  -- For each matching line, include full context block (from previous empty line to next empty line)
   for i = 1, #lines do
     if matching_lines[i] then
       match_count = match_count + 1
@@ -193,6 +196,16 @@ local function build_context_blocks(lines, matching_lines, current_line_num)
         lines_to_include[j] = true
         block_start = j
         j = j - 1
+      end
+      
+      -- Walk forwards until we hit an empty line or end of file
+      j = i + 1
+      while j <= #lines do
+        if lines[j]:match('^%s*$') then
+          break
+        end
+        lines_to_include[j] = true
+        j = j + 1
       end
       
       table.insert(block_starts, block_start)
@@ -236,13 +249,11 @@ local function build_context_blocks(lines, matching_lines, current_line_num)
 end
 
 function FilterLog()
-  -- If this is a filtered buffer, reload it first to get original content
-  if vim.b.log_filter_original_file then
-    vim.cmd('edit!')
-  end
+  -- Don't reload if this is already a filtered buffer - allow stacking filters
+  -- (e.g., time filter followed by regex filter)
   
   -- Store original filename for reference
-  local original_file = vim.api.nvim_buf_get_name(0)
+  local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
   local original_name = vim.fn.fnamemodify(original_file, ':t')
   
   -- Save current line and position to restore after filtering
@@ -259,6 +270,32 @@ function FilterLog()
     
     -- Get all lines
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    
+    -- Find where headers end (scan for header patterns)
+    local header_end = 0
+    local in_file_list = false
+    
+    for i = 1, math.min(100, #lines) do
+      local line = lines[i]
+      
+      -- Track if we're in the file list section
+      if line:match('^Original files:') then
+        in_file_list = true
+        header_end = i
+      elseif in_file_list and (line:match('^From:') or line:match('^Filter:') or line:match('^%-+$')) then
+        -- Exiting file list section
+        in_file_list = false
+        header_end = i
+      elseif in_file_list or line:match('^Original file:') or line:match('^From:') or 
+             line:match('^To:') or line:match('^Filter:') or 
+             line == '' or line:match('^%-+$') then
+        header_end = i
+      else
+        -- Hit actual content
+        break
+      end
+    end
+    
     local matching_lines
     
     -- Try ripgrep first for speed (if file is saved)
@@ -279,27 +316,92 @@ function FilterLog()
       end
     end
     
+    -- Remove any matches in the header section
+    for i = 1, header_end do
+      matching_lines[i] = nil
+    end
+    
     -- Check if we found any matches
     if vim.tbl_count(matching_lines) == 0 then
       vim.notify('No matching lines found!', vim.log.levels.WARN)
       return
     end
     
-    -- Build context blocks
-    local result_lines, line_mapping, match_count = build_context_blocks(lines, matching_lines, current_line_num)
+    -- Build context blocks from content lines only (after headers)
+    -- Create a subset of lines starting after headers
+    local content_lines = {}
+    local content_matching = {}
     
-    -- Prepend header with original file and filter info
-    table.insert(result_lines, 1, '')
-    table.insert(result_lines, 1, string.rep('-', 80))
-    table.insert(result_lines, 1, '')
-    table.insert(result_lines, 1, 'Filter: ' .. pattern)
-    table.insert(result_lines, 1, 'Original file: ' .. original_name)
+    for i = header_end + 1, #lines do
+      table.insert(content_lines, lines[i])
+      -- Map matching lines to new indices
+      if matching_lines[i] then
+        content_matching[i - header_end] = true
+      end
+    end
+    
+    -- Build context blocks from content
+    local result_lines, line_mapping, match_count = build_context_blocks(content_lines, content_matching, current_line_num)
+    
+    -- Extract headers for preservation
+    local header_lines = {}
+    for i = 1, header_end do
+      table.insert(header_lines, lines[i])
+    end
+    
+    -- Preserve existing headers and add/update filter info
+    local final_header_lines = {}
+    
+    -- Remove old Filter lines from preserved headers
+    for _, line in ipairs(header_lines) do
+      if not line:match('^Filter:') then
+        table.insert(final_header_lines, line)
+      end
+    end
+    
+    -- Remove trailing empty lines and dashes
+    while #final_header_lines > 0 do
+      local last_line = final_header_lines[#final_header_lines]
+      if last_line == '' or last_line:match('^%-+$') then
+        table.remove(final_header_lines)
+      else
+        break
+      end
+    end
+    
+    -- If we have preserved headers, add separator
+    if #final_header_lines > 0 then
+      table.insert(final_header_lines, '')
+      table.insert(final_header_lines, string.rep('-', 80))
+      table.insert(final_header_lines, '')
+    else
+      -- No existing headers, add original file header
+      table.insert(final_header_lines, 'Original file: ' .. original_name)
+      table.insert(final_header_lines, '')
+      table.insert(final_header_lines, string.rep('-', 80))
+      table.insert(final_header_lines, '')
+    end
+    
+    -- Add filter line
+    table.insert(final_header_lines, 'Filter: ' .. pattern)
+    table.insert(final_header_lines, '')
+    table.insert(final_header_lines, string.rep('-', 80))
+    table.insert(final_header_lines, '')
+    
+    -- Combine headers with filtered content
+    local final_lines = {}
+    for _, line in ipairs(final_header_lines) do
+      table.insert(final_lines, line)
+    end
+    for _, line in ipairs(result_lines) do
+      table.insert(final_lines, line)
+    end
     
     -- Set winbar to show filter at top of window (stays fixed while scrolling)
     vim.wo.winbar = '%#Comment#Filter: ' .. pattern .. ' %#Normal#' .. string.rep('─', 60)
     
     -- Replace buffer contents with matching lines
-    vim.api.nvim_buf_set_lines(0, 0, -1, false, result_lines)
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, final_lines)
     
     -- Make buffer not directly saveable to prevent overwriting original
     vim.bo.buftype = 'acwrite'
@@ -409,14 +511,37 @@ function SaveFiltered()
     return
   end
   
-  -- Check if this is an analysis buffer
-  local is_analysis = vim.b.log_filter_is_analysis
-  local extension = is_analysis and '.filtered.analysis' or '.filtered'
-  local filtered_file = original_file .. extension
+  -- Remove any existing .filtered, .compound, .timestamp extensions from original_file to get base name
+  local base_file = original_file:gsub('%.filtered.*$', ''):gsub('%.compound$', ''):gsub('%.timestamp$', '')
   
+  -- The target filtered file (always .filtered, no other extensions)
+  local filtered_file = base_file .. '.filtered'
+  
+  -- Check if filtered file already exists
+  if vim.fn.filereadable(filtered_file) == 1 then
+    -- Find the next available .old_N suffix
+    local old_num = 1
+    local old_file = filtered_file .. '.old_' .. old_num
+    
+    while vim.fn.filereadable(old_file) == 1 do
+      old_num = old_num + 1
+      old_file = filtered_file .. '.old_' .. old_num
+    end
+    
+    -- Rename existing .filtered to .old_N
+    local success = vim.fn.rename(filtered_file, old_file)
+    if success == 0 then
+      vim.notify('Backed up previous filter to: ' .. vim.fn.fnamemodify(old_file, ':t'), vim.log.levels.INFO)
+    end
+  end
+  
+  -- Save current buffer to .filtered
   vim.bo.buftype = ''
   vim.cmd('write! ' .. vim.fn.fnameescape(filtered_file))
-  vim.bo.buftype = 'acwrite'
+  
+  -- Open the newly saved .filtered file
+  vim.cmd('edit ' .. vim.fn.fnameescape(filtered_file))
+  
   vim.notify('Saved to: ' .. filtered_file, vim.log.levels.INFO)
 end
 
@@ -446,4 +571,546 @@ function UndoFilter()
   if current_line_num <= total_lines then
     vim.api.nvim_win_set_cursor(0, {current_line_num, 0})
   end
+end
+
+-- Parse timestamp from a log line (format: "2025-12-16 12:29:08.849")
+-- Returns: timestamp string or nil if not found
+local function parse_timestamp(line)
+  -- Match timestamp pattern: YYYY-MM-DD HH:MM:SS.mmm
+  local timestamp = line:match('^%s*(%d%d%d%d%-%d%d%-%d%d%s+%d%d:%d%d:%d%d%.%d+)')
+  return timestamp
+end
+
+-- Compare two timestamps (returns -1 if a < b, 0 if equal, 1 if a > b)
+local function compare_timestamps(ts_a, ts_b)
+  if not ts_a and not ts_b then return 0 end
+  if not ts_a then return 1 end  -- Lines without timestamps go to the end
+  if not ts_b then return -1 end
+  
+  if ts_a < ts_b then return -1 end
+  if ts_a > ts_b then return 1 end
+  return 0
+end
+
+-- Parse lines into log entry blocks (multi-line entries grouped by timestamp)
+local function parse_log_entries(lines)
+  local entries = {}
+  local current_entry = nil
+  
+  for i, line in ipairs(lines) do
+    local timestamp = parse_timestamp(line)
+    
+    if timestamp then
+      -- Start a new log entry
+      if current_entry then
+        table.insert(entries, current_entry)
+      end
+      current_entry = {
+        timestamp = timestamp,
+        lines = {line}
+      }
+    else
+      -- Continuation of current entry (or orphan line at start)
+      if current_entry then
+        table.insert(current_entry.lines, line)
+      else
+        -- Orphan line at the start without a timestamp - create entry without timestamp
+        current_entry = {
+          timestamp = nil,
+          lines = {line}
+        }
+      end
+    end
+  end
+  
+  -- Don't forget the last entry
+  if current_entry then
+    table.insert(entries, current_entry)
+  end
+  
+  return entries
+end
+
+-- Check if file has a compressed extension
+local function is_compressed_file(filepath)
+  local compressed_extensions = {'.zip', '.gz', '.tar.gz', '.tgz', '.7z', '.bz2', '.tar.bz2', '.xz', '.tar.xz'}
+  local filename = filepath:lower()
+  
+  for _, ext in ipairs(compressed_extensions) do
+    if filename:sub(-#ext) == ext then
+      return true, ext
+    end
+  end
+  
+  return false, nil
+end
+
+-- Check if file is compressed and return the decompression command if available
+local function get_decompress_command(filepath)
+  if not config.decompress_commands then
+    return nil, nil
+  end
+  
+  local filename = filepath:lower()
+  
+  -- Check for multi-part extensions first (e.g., .tar.gz)
+  for ext, cmd in pairs(config.decompress_commands) do
+    if filename:sub(-#ext) == ext:lower() then
+      return cmd, ext
+    end
+  end
+  
+  return nil, nil
+end
+
+-- Read file content, decompressing if needed
+local function read_file_content(filepath)
+  -- First check if file is compressed
+  local is_compressed, ext = is_compressed_file(filepath)
+  
+  if is_compressed then
+    -- Check if we have a decompression command configured
+    local decompress_cmd = get_decompress_command(filepath)
+    
+    if not decompress_cmd then
+      return nil, 'Compressed file (' .. ext .. ') detected but decompress_commands not configured. Please set up decompress_commands in your config.'
+    end
+    
+    -- Format the command with the filepath
+    -- Escape the filepath for Windows command line
+    local escaped_filepath = filepath:gsub('"', '""')
+    local cmd = string.format(decompress_cmd, escaped_filepath)
+    
+    -- On Windows, wrap the command with cmd /c to ensure proper parsing
+    if vim.fn.has('win32') == 1 or vim.fn.has('win64') == 1 then
+      cmd = 'cmd /c "' .. cmd .. '"'
+    end
+    
+    -- Decompress the file
+    local handle = io.popen(cmd .. ' 2>&1')  -- Capture stderr too
+    if not handle then
+      return nil, 'Failed to run decompression command'
+    end
+    
+    local output = handle:read('*all')
+    local success = handle:close()
+    
+    -- Split output into lines
+    local lines = {}
+    for line in output:gmatch('[^\r\n]+') do
+      table.insert(lines, line)
+    end
+    
+    if #lines == 0 then
+      return nil, 'Decompression command returned no data'
+    end
+    
+    -- Check if output looks like 7zip status messages instead of file content
+    local first_line = lines[1] or ''
+    if first_line:match('^7%-Zip') or first_line:match('^Extracting') or first_line:match('^Everything is Ok') then
+      return nil, 'Decompression command returned status messages instead of file content. Try using: 7z e -so "%%s" | findstr "."'
+    end
+    
+    return lines, nil
+  else
+    -- Regular file read
+    local file = io.open(filepath, 'r')
+    if not file then
+      return nil, 'Failed to read file'
+    end
+    
+    local lines = {}
+    for line in file:lines() do
+      table.insert(lines, line)
+    end
+    file:close()
+    
+    return lines, nil
+  end
+end
+
+-- Merge lines from new file into current buffer in chronological order
+local function merge_lines_chronologically(current_lines, new_lines)
+  -- Parse both sets of lines into log entry blocks
+  local current_entries = parse_log_entries(current_lines)
+  local new_entries = parse_log_entries(new_lines)
+  
+  -- Combine all entries
+  local all_entries = {}
+  for _, entry in ipairs(current_entries) do
+    table.insert(all_entries, entry)
+  end
+  for _, entry in ipairs(new_entries) do
+    table.insert(all_entries, entry)
+  end
+  
+  -- Sort entries by timestamp
+  table.sort(all_entries, function(a, b)
+    return compare_timestamps(a.timestamp, b.timestamp) < 0
+  end)
+  
+  -- Flatten entries back into lines with empty lines between entries
+  local merged_lines = {}
+  for i, entry in ipairs(all_entries) do
+    -- Add empty line before entry (except first entry)
+    if i > 1 then
+      table.insert(merged_lines, '')
+    end
+    
+    -- Add all lines from the entry
+    for _, line in ipairs(entry.lines) do
+      table.insert(merged_lines, line)
+    end
+  end
+  
+  return merged_lines
+end
+
+function AddLogFile()
+  -- Use vim.ui.select to choose files (supports telescope if available)
+  local has_telescope, telescope_builtin = pcall(require, 'telescope.builtin')
+  
+  if has_telescope then
+    -- Use telescope's file picker for better UX (supports multi-select)
+    local conf = require('telescope.config').values
+    telescope_builtin.find_files({
+      prompt_title = 'Select log file(s) to add (use ' .. config.multi_select_key .. ' to multi-select)',
+      file_ignore_patterns = {},  -- Don't filter out any files (including .zip, .gz, etc.)
+      file_sorter = require('telescope.sorters').get_fuzzy_file({ sorting_strategy = 'descending' }),
+      attach_mappings = function(prompt_bufnr, map)
+        local actions = require('telescope.actions')
+        local action_state = require('telescope.actions.state')
+        
+        -- Map the configured key for multi-select
+        map('i', config.multi_select_key, actions.toggle_selection + actions.move_selection_worse)
+        map('n', config.multi_select_key, actions.toggle_selection + actions.move_selection_worse)
+        
+        actions.select_default:replace(function()
+          local picker = action_state.get_current_picker(prompt_bufnr)
+          local selections = picker:get_multi_selection()
+          actions.close(prompt_bufnr)
+          
+          -- If no multi-selection, use single selection
+          if #selections == 0 then
+            local selection = action_state.get_selected_entry()
+            if selection then
+              selections = {selection}
+            end
+          end
+          
+          if #selections == 0 then
+            return
+          end
+          
+          -- Get current buffer info
+          local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
+          local original_name = vim.fn.fnamemodify(original_file, ':t')
+          
+          -- Get current buffer lines and strip empty lines to avoid duplication
+          local current_lines_raw = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+          local current_lines = {}
+          for _, line in ipairs(current_lines_raw) do
+            if line ~= '' then
+              table.insert(current_lines, line)
+            end
+          end
+          
+          local success_count = 0
+          local added_files = {}
+          
+          -- Add original file to the list if it has content
+          if #current_lines > 0 and original_name ~= '' then
+            table.insert(added_files, original_name)
+          end
+          
+          -- Process each selected file
+          for _, selection in ipairs(selections) do
+            local filepath = selection.path or selection[1]
+            
+            -- Read the file (with decompression if needed)
+            local new_lines_raw, err = read_file_content(filepath)
+            
+            if new_lines_raw then
+              -- Strip empty lines from new file to avoid duplication when merging
+              local new_lines = {}
+              for _, line in ipairs(new_lines_raw) do
+                if line ~= '' then
+                  table.insert(new_lines, line)
+                end
+              end
+              
+              -- Merge chronologically with accumulated lines
+              current_lines = merge_lines_chronologically(current_lines, new_lines)
+              
+              -- Strip empty lines from result to prepare for next merge
+              local stripped_lines = {}
+              for _, line in ipairs(current_lines) do
+                if line ~= '' then
+                  table.insert(stripped_lines, line)
+                end
+              end
+              current_lines = stripped_lines
+              
+              success_count = success_count + 1
+              table.insert(added_files, vim.fn.fnamemodify(filepath, ':t'))
+              
+              vim.notify('Added ' .. vim.fn.fnamemodify(filepath, ':t') .. ' (' .. #new_lines_raw .. ' lines)', vim.log.levels.INFO)
+            else
+              vim.notify(err or ('Failed to read: ' .. filepath), vim.log.levels.ERROR)
+            end
+          end
+          
+          -- After all merges are complete, do one final merge to add proper spacing
+          if success_count > 0 then
+            current_lines = merge_lines_chronologically(current_lines, {})
+          end
+          
+          -- Only update buffer and show merged message if we successfully added files
+          if success_count > 0 then
+            -- Temporarily reset buftype to allow editing
+            local original_buftype = vim.bo.buftype
+            vim.bo.buftype = ''
+            
+            -- Prepend header with list of files added
+            local header_lines = {}
+            table.insert(header_lines, 'Original files:')
+            for _, filename in ipairs(added_files) do
+              table.insert(header_lines, filename)
+            end
+            table.insert(header_lines, '')
+            table.insert(header_lines, string.rep('-', 80))
+            table.insert(header_lines, '')
+            
+            -- Combine header with content
+            local final_lines = {}
+            for _, line in ipairs(header_lines) do
+              table.insert(final_lines, line)
+            end
+            for _, line in ipairs(current_lines) do
+              table.insert(final_lines, line)
+            end
+            
+            -- Update buffer contents
+            vim.api.nvim_buf_set_lines(0, 0, -1, false, final_lines)
+            
+            -- Mark buffer as compound and store original name
+            local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
+            vim.b.log_filter_original_file = original_file
+            vim.b.log_filter_is_compound = true
+            
+            -- Update buffer name to include .compound
+            local current_name = vim.api.nvim_buf_get_name(0)
+            if current_name ~= '' and not current_name:match('%.compound') then
+              local base_name = vim.fn.fnamemodify(current_name, ':t:r')
+              local new_name = base_name .. '.compound'
+              pcall(vim.api.nvim_buf_set_name, 0, new_name)
+            end
+            
+            -- Restore buftype if it was set
+            if original_buftype ~= '' then
+              vim.bo.buftype = original_buftype
+            end
+            
+            vim.bo.modified = false
+            vim.notify('Merged ' .. success_count .. ' file(s): ' .. table.concat(added_files, ', '), vim.log.levels.INFO)
+          end
+        end)
+        
+        return true
+      end,
+    })
+  else
+    -- Fallback: use vim.ui.input to get file path
+    vim.ui.input({
+      prompt = 'Enter log file path: ',
+      completion = 'file',
+    }, function(filepath)
+      if not filepath or filepath == '' then
+        return
+      end
+      
+      -- Read the file (with decompression if needed)
+      local new_lines, err = read_file_content(filepath)
+      if not new_lines then
+        vim.notify(err or ('Failed to read: ' .. filepath), vim.log.levels.ERROR)
+        return
+      end
+      
+      -- Get current buffer lines
+      local current_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+      
+      -- Merge chronologically
+      local merged_lines = merge_lines_chronologically(current_lines, new_lines)
+      
+      -- Replace buffer contents with merged lines
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, merged_lines)
+      vim.notify('Added ' .. vim.fn.fnamemodify(filepath, ':t'), vim.log.levels.INFO)
+    end)
+  end
+end
+
+function FilterByTime()
+  -- Get all lines
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  
+  -- Find first and last timestamps for default values
+  local first_timestamp = nil
+  local last_timestamp = nil
+  
+  for _, line in ipairs(lines) do
+    local timestamp = parse_timestamp(line)
+    if timestamp then
+      if not first_timestamp then
+        first_timestamp = timestamp
+      end
+      last_timestamp = timestamp
+    end
+  end
+  
+  -- Get start time from user
+  vim.ui.input({
+    prompt = 'Enter start time (YYYY-MM-DD HH:MM:SS): ',
+    default = first_timestamp or '',
+  }, function(start_time)
+    if not start_time or start_time == '' then
+      return
+    end
+    
+    -- Get end time from user
+    vim.ui.input({
+      prompt = 'Enter end time (YYYY-MM-DD HH:MM:SS): ',
+      default = last_timestamp or '',
+    }, function(end_time)
+      if not end_time or end_time == '' then
+        return
+      end
+      
+      -- Store original file reference
+      local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
+      local original_name = vim.fn.fnamemodify(original_file, ':t')
+      
+      -- Parse lines into log entry blocks
+      local entries = parse_log_entries(lines)
+      local filtered_entries = {}
+      local match_count = 0
+      
+      -- Filter entries by time range
+      for _, entry in ipairs(entries) do
+        if entry.timestamp then
+          -- Compare timestamp with start and end times
+          if entry.timestamp >= start_time and entry.timestamp <= end_time then
+            table.insert(filtered_entries, entry)
+            match_count = match_count + 1
+          end
+        end
+      end
+      
+      if match_count == 0 then
+        vim.notify('No log entries found in time range!', vim.log.levels.WARN)
+        return
+      end
+      
+      -- Flatten entries back into lines
+      local filtered_lines = {}
+      for _, entry in ipairs(filtered_entries) do
+        for _, line in ipairs(entry.lines) do
+          table.insert(filtered_lines, line)
+        end
+      end
+      
+      -- Preserve existing headers (Original files list) and add time filter info
+      local header_lines = {}
+      local existing_header_end = 0
+      
+      -- Check if buffer has existing headers to preserve
+      if #lines > 0 then
+        local i = 1
+        local in_header = true
+        while i <= #lines and in_header do
+          local line = lines[i]
+          -- Check if we've reached the actual log content (line with timestamp)
+          local has_timestamp = parse_timestamp(line)
+          if has_timestamp then
+            -- We've hit the log content, stop here
+            in_header = false
+            existing_header_end = i - 1
+          else
+            -- Still in header section
+            i = i + 1
+          end
+        end
+        
+        -- If we went through everything without finding a timestamp, use all lines as header
+        if in_header then
+          existing_header_end = #lines
+        end
+      end
+      
+      -- Keep existing headers if found (excluding old From/To lines)
+      if existing_header_end > 0 then
+        for i = 1, existing_header_end do
+          local line = lines[i]
+          -- Skip old From/To lines if they exist
+          if not line:match('^From:') and not line:match('^To:') then
+            table.insert(header_lines, line)
+          end
+        end
+        
+        -- Remove trailing empty lines and dashes from preserved headers
+        while #header_lines > 0 do
+          local last_line = header_lines[#header_lines]
+          if last_line == '' or last_line:match('^%-+$') then
+            table.remove(header_lines)
+          else
+            break
+          end
+        end
+        
+        -- Add back separator
+        table.insert(header_lines, '')
+        table.insert(header_lines, string.rep('-', 80))
+        table.insert(header_lines, '')
+      else
+        -- Add original file header if no existing headers
+        if original_name and original_name ~= '' then
+          table.insert(header_lines, 'Original file: ' .. original_name)
+          table.insert(header_lines, '')
+          table.insert(header_lines, string.rep('-', 80))
+          table.insert(header_lines, '')
+        end
+      end
+      
+      -- Add time filter info at the end of headers
+      table.insert(header_lines, 'From: ' .. start_time)
+      table.insert(header_lines, 'To: ' .. end_time)
+      table.insert(header_lines, '')
+      table.insert(header_lines, string.rep('-', 80))
+      table.insert(header_lines, '')
+      
+      -- Combine preserved headers with filtered content
+      local final_lines = {}
+      for _, line in ipairs(header_lines) do
+        table.insert(final_lines, line)
+      end
+      for _, line in ipairs(filtered_lines) do
+        table.insert(final_lines, line)
+      end
+      
+      -- Set winbar to show time filter
+      vim.wo.winbar = '%#Comment#Time: ' .. start_time .. ' → ' .. end_time .. ' %#Normal#' .. string.rep('─', 40)
+      
+      -- Replace buffer contents
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, final_lines)
+      
+      -- Make buffer not directly saveable
+      vim.bo.buftype = 'acwrite'
+      vim.bo.modified = false
+      
+      -- Store original file path and mark as time filtered
+      vim.b.log_filter_original_file = original_file
+      vim.b.log_filter_is_time_filtered = true
+      
+      vim.notify('Filtered to ' .. match_count .. ' entries in time range', vim.log.levels.INFO)
+    end)
+  end)
 end

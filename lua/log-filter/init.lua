@@ -11,6 +11,16 @@ local defaults = {
   history_file = vim.fn.stdpath('cache') .. '/log_filter_history.txt',
   max_history = 20,
   load_entry_key = '<C-e>',
+  multi_select_key = '<C-e>',
+  -- Decompression commands (nil by default - user must configure)
+  -- Example: decompress_commands = {
+  --   ['.zip'] = '7z x -so "%s"',
+  --   ['.gz'] = 'gzip -dc "%s"',
+  --   ['.tar.gz'] = 'tar -xzOf "%s"',
+  --   ['.7z'] = '7z x -so "%s"',
+  -- }
+  -- %s will be replaced with the file path
+  decompress_commands = nil,
 }
 
 -- Module configuration (will be set by setup)
@@ -29,5 +39,7 @@ M.filter_log = FilterLog
 M.show_matching_lines = ShowMatchingLines
 M.save_filtered = SaveFiltered
 M.undo_filter = UndoFilter
+M.add_log_file = AddLogFile
+M.filter_by_time = FilterByTime
 
 return M
