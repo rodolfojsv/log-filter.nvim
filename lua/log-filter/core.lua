@@ -271,6 +271,7 @@ function FilterLog()
     -- Parse existing headers BEFORE reload to preserve accumulated patterns
     local existing_filter_patterns = {}
     local existing_exclude_patterns = {}
+    local existing_time_section = {}
     
     if vim.bo.buftype == 'acwrite' then
       local current_lines = vim.api.nvim_buf_get_lines(0, 0, 100, false)
@@ -281,6 +282,8 @@ function FilterLog()
         elseif line:match('^Exclude:%s*(.+)') then
           local exclude_pattern = line:match('^Exclude:%s*(.+)')
           table.insert(existing_exclude_patterns, exclude_pattern)
+        elseif line:match('^From:%s*(.+)') or line:match('^To:%s*(.+)') then
+          table.insert(existing_time_section, line)
         elseif line:match('^%-+$') then
           break  -- End of headers
         end
@@ -288,8 +291,10 @@ function FilterLog()
     end
     
     -- If we have an original file stored and this is a filtered buffer, reload it first
+    -- UNLESS it's time-filtered, in which case we want to keep the time-filtered content
     local was_filtered = vim.bo.buftype == 'acwrite'
-    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 then
+    local is_time_filtered = vim.b.log_filter_is_time_filtered
+    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 and not is_time_filtered then
       -- Reload original file
       vim.cmd('edit! ' .. vim.fn.fnameescape(original_file))
       -- Restore original file tracking
@@ -334,7 +339,7 @@ function FilterLog()
     
     -- Parse existing headers into sections (use pre-reload patterns if available)
     local original_files_section = {}
-    local time_section = {}
+    local time_section = existing_time_section  -- Use preserved time section
     local filter_patterns = existing_filter_patterns  -- Use preserved patterns
     local exclude_patterns = existing_exclude_patterns  -- Use preserved patterns
     
@@ -346,7 +351,8 @@ function FilterLog()
       elseif in_files_list and not line:match('^From:') and not line:match('^To:') and not line:match('^Filter:') and not line:match('^Exclude:') and line ~= '' and not line:match('^%-+$') then
         -- This is part of the file list
         table.insert(original_files_section, line)
-      elseif line:match('^From:') or line:match('^To:') then
+      elseif #existing_time_section == 0 and (line:match('^From:') or line:match('^To:')) then
+        -- Only parse time section from file if we didn't preserve one from before reload
         in_files_list = false
         table.insert(time_section, line)
       end
@@ -537,6 +543,11 @@ function FilterLog()
     -- Store original file path for save-as functionality
     vim.b.log_filter_original_file = original_file
     
+    -- Preserve time-filtered flag if it was set
+    if is_time_filtered then
+      vim.b.log_filter_is_time_filtered = true
+    end
+    
     -- Smart cursor positioning
     -- Try to find exact line match first
     local found_exact = false
@@ -598,6 +609,7 @@ function FilterLogNegated()
     -- Parse existing headers BEFORE reload to preserve accumulated patterns
     local existing_filter_patterns = {}
     local existing_exclude_patterns = {}
+    local existing_time_section = {}
     
     if vim.bo.buftype == 'acwrite' then
       local current_lines = vim.api.nvim_buf_get_lines(0, 0, 100, false)
@@ -608,6 +620,8 @@ function FilterLogNegated()
         elseif line:match('^Exclude:%s*(.+)') then
           local exclude_pattern = line:match('^Exclude:%s*(.+)')
           table.insert(existing_exclude_patterns, exclude_pattern)
+        elseif line:match('^From:%s*(.+)') or line:match('^To:%s*(.+)') then
+          table.insert(existing_time_section, line)
         elseif line:match('^%-+$') then
           break  -- End of headers
         end
@@ -615,8 +629,10 @@ function FilterLogNegated()
     end
     
     -- If we have an original file stored and this is a filtered buffer, reload it first
+    -- UNLESS it's time-filtered, in which case we want to keep the time-filtered content
     local was_filtered = vim.bo.buftype == 'acwrite'
-    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 then
+    local is_time_filtered = vim.b.log_filter_is_time_filtered
+    if was_filtered and original_file and vim.fn.filereadable(original_file) == 1 and not is_time_filtered then
       -- Reload original file
       vim.cmd('edit! ' .. vim.fn.fnameescape(original_file))
       -- Restore original file tracking
@@ -656,7 +672,7 @@ function FilterLogNegated()
     
     -- Parse existing headers (use pre-reload patterns if available)
     local original_files_section = {}
-    local time_section = {}
+    local time_section = existing_time_section  -- Use preserved time section
     local filter_patterns = existing_filter_patterns  -- Use preserved patterns
     local exclude_patterns = existing_exclude_patterns  -- Use preserved patterns
     
@@ -667,7 +683,8 @@ function FilterLogNegated()
         in_files_list = line:match('^Original files:') ~= nil
       elseif in_files_list and not line:match('^From:') and not line:match('^To:') and not line:match('^Filter:') and not line:match('^Exclude:') and line ~= '' and not line:match('^%-+$') then
         table.insert(original_files_section, line)
-      elseif line:match('^From:') or line:match('^To:') then
+      elseif #existing_time_section == 0 and (line:match('^From:') or line:match('^To:')) then
+        -- Only parse time section from file if we didn't preserve one from before reload
         in_files_list = false
         table.insert(time_section, line)
       end
@@ -851,6 +868,11 @@ function FilterLogNegated()
     vim.bo.modified = false
     vim.b.log_filter_original_file = original_file
     
+    -- Preserve time-filtered flag if it was set
+    if is_time_filtered then
+      vim.b.log_filter_is_time_filtered = true
+    end
+    
     -- Position cursor
     local found_exact = false
     for i, line in ipairs(result_lines) do
@@ -970,12 +992,22 @@ function SaveFiltered()
     local success = vim.fn.rename(filtered_file, old_file)
   end
   
-  -- Save current buffer to .filtered
+  -- Get current content before modifying buffer settings
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  
+  -- Temporarily change buftype to allow writing
   vim.bo.buftype = ''
   vim.cmd('write! ' .. vim.fn.fnameescape(filtered_file))
   
-  -- Open the newly saved .filtered file
-  vim.cmd('edit ' .. vim.fn.fnameescape(filtered_file))
+  -- Restore buftype to acwrite to keep it as a filtered buffer
+  vim.bo.buftype = 'acwrite'
+  vim.bo.modified = false
+  
+  -- Update the buffer name to the new file
+  vim.api.nvim_buf_set_name(0, filtered_file)
+  
+  -- Preserve the original file reference for potential further filtering
+  vim.b.log_filter_original_file = original_file
   
   vim.notify('Saved to: ' .. filtered_file, vim.log.levels.INFO)
 end
@@ -1388,6 +1420,25 @@ function AddLogFile()
 end
 
 function FilterByTime()
+  -- Parse existing headers BEFORE anything else to preserve Filter/Exclude patterns
+  local existing_filter_patterns = {}
+  local existing_exclude_patterns = {}
+  
+  if vim.bo.buftype == 'acwrite' then
+    local current_lines = vim.api.nvim_buf_get_lines(0, 0, 100, false)
+    for _, line in ipairs(current_lines) do
+      if line:match('^Filter:%s*(.+)') then
+        local filter_pattern = line:match('^Filter:%s*(.+)')
+        table.insert(existing_filter_patterns, filter_pattern)
+      elseif line:match('^Exclude:%s*(.+)') then
+        local exclude_pattern = line:match('^Exclude:%s*(.+)')
+        table.insert(existing_exclude_patterns, exclude_pattern)
+      elseif line:match('^%-+$') then
+        break  -- End of headers
+      end
+    end
+  end
+  
   -- Get all lines
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   
@@ -1494,7 +1545,7 @@ function FilterByTime()
         end
       end
       
-      -- Parse existing headers into sections
+      -- Parse existing headers into sections (use pre-parsed patterns if available)
       local original_files_section = {}
       local filter_section = {}
       local exclude_section = {}
@@ -1513,6 +1564,21 @@ function FilterByTime()
         elseif line:match('^Exclude:') then
           in_files_list = false
           table.insert(exclude_section, line)
+        end
+      end
+      
+      -- Override with pre-parsed patterns if we had them
+      if #existing_filter_patterns > 0 then
+        filter_section = {}
+        for _, pattern in ipairs(existing_filter_patterns) do
+          table.insert(filter_section, 'Filter: ' .. pattern)
+        end
+      end
+      
+      if #existing_exclude_patterns > 0 then
+        exclude_section = {}
+        for _, pattern in ipairs(existing_exclude_patterns) do
+          table.insert(exclude_section, 'Exclude: ' .. pattern)
         end
       end
       
