@@ -1243,7 +1243,12 @@ function AddLogFile()
   if has_telescope then
     -- Use telescope's file picker for better UX (supports multi-select)
     local conf = require('telescope.config').values
+    -- Get the directory of the current file
+    local original_file = vim.b.log_filter_original_file or vim.api.nvim_buf_get_name(0)
+    local current_dir = vim.fn.fnamemodify(original_file, ':h')
+    
     telescope_builtin.find_files({
+      cwd = current_dir,  -- Only show files in current directory
       prompt_title = 'Select log file(s) to add (use ' .. config.multi_select_key .. ' to multi-select)',
       file_ignore_patterns = {},  -- Don't filter out any files (including .zip, .gz, etc.)
       file_sorter = require('telescope.sorters').get_fuzzy_file({ sorting_strategy = 'descending' }),
@@ -1688,3 +1693,4 @@ function FilterByTime()
     end)
   end)
 end
+
