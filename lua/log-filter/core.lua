@@ -147,7 +147,7 @@ local function filter_with_ripgrep(pattern, lines, current_line_num)
   local clean_pattern = pattern:gsub('^%((.*)%)$', '%1')
   
   -- Run ripgrep to get matching line numbers
-  local cmd = string.format('rg --line-number --no-heading --color=never -e "%s" "%s"', 
+  local cmd = string.format('rg -P --line-number --no-heading --color=never -e "%s" "%s"', 
     clean_pattern:gsub('"', '\\"'), bufname)
   
   local handle = io.popen(cmd)
